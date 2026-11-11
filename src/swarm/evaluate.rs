@@ -87,6 +87,7 @@ pub async fn evaluate_loop(
         role: "user".to_string(),
         content: config.generator_prompt.clone(),
         tool_use_id: None,
+        tool_calls: Vec::new(),
     }];
 
     for round in 1..=config.max_rounds {
@@ -109,6 +110,7 @@ pub async fn evaluate_loop(
             role: "assistant".to_string(),
             content: output.clone(),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         });
 
         // Step 2: Evaluate
@@ -120,6 +122,7 @@ pub async fn evaluate_loop(
             role: "user".to_string(),
             content: eval_prompt,
             tool_use_id: None,
+            tool_calls: Vec::new(),
         }];
         let evaluator_model = config.evaluator_model.clone();
 
@@ -165,6 +168,7 @@ pub async fn evaluate_loop(
                     score * 100.0, feedback
                 ),
                 tool_use_id: None,
+                tool_calls: Vec::new(),
             });
         }
     }

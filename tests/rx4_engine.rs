@@ -44,6 +44,7 @@ struct ToolThenTextProvider {
     seen_system: Mutex<Vec<String>>,
     seen_tools: Mutex<Vec<Vec<String>>>,
     seen_messages: Mutex<Vec<Vec<String>>>,
+    seen_transcript: Mutex<Vec<Vec<apollo::providers::ChatMessage>>>,
 }
 
 impl ToolThenTextProvider {
@@ -53,6 +54,7 @@ impl ToolThenTextProvider {
             seen_system: Mutex::new(Vec::new()),
             seen_tools: Mutex::new(Vec::new()),
             seen_messages: Mutex::new(Vec::new()),
+            seen_transcript: Mutex::new(Vec::new()),
         }
     }
 }
@@ -74,6 +76,10 @@ impl Provider for ToolThenTextProvider {
     }
 
     async fn chat(&self, request: &ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
+        self.seen_transcript
+            .lock()
+            .unwrap()
+            .push(request.messages.to_vec());
         self.seen_messages
             .lock()
             .unwrap()
@@ -198,6 +204,120 @@ fn message(chat_id: &str, text: &str) -> IncomingMessage {
     }
 }
 
+#[tokio::test]
+async fn tool_allowlist_applies_to_initial_and_late_tools() {
+    let h = harness().await;
+    let runner = h.runner.with_toolsets(apollo::config::ToolsetConfig {
+        enabled: vec!["zkr_memory".into()],
+        disabled: vec![],
+    });
+    runner
+        .add_tool(Arc::new(ProbeTool {
+            runs: Arc::clone(&h.tool_runs),
+        }))
+        .await;
+    let _ = runner
+        .handle_message(
+            &message("restricted", "read hello.txt"),
+            &NullChannel::new("test"),
+        )
+        .await;
+    assert_eq!(h.tool_runs.load(Ordering::SeqCst), 0);
+    let seen = h.provider.seen_tools.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen
+        .iter()
+        .all(|tools| !tools.iter().any(|name| name == "probe")));
+}
+
+#[tokio::test]
+async fn openai_provider_sends_matching_tool_call_and_result() {
+    let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let captured = Arc::clone(&requests);
+    let app = axum::Router::new().route("/chat/completions", axum::routing::post(
+        move |axum::Json(body): axum::Json<serde_json::Value>| {
+            let captured = Arc::clone(&captured);
+            async move {
+                let mut requests = captured.lock().unwrap();
+                requests.push(body);
+                let message = if requests.len() == 1 {
+                    serde_json::json!({"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"probe","arguments":"{}"}}]})
+                } else {
+                    serde_json::json!({"content":"finished"})
+                };
+                axum::Json(serde_json::json!({"choices":[{"message":message}]}))
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let provider = apollo::providers::openai_compat::OpenAiCompatProvider::new(
+        "test",
+        format!("http://{address}"),
+        "test",
+    );
+    let runner = AgentRunner::new(
+        Arc::new(provider),
+        vec![Arc::new(ProbeTool {
+            runs: Arc::new(AtomicUsize::new(0)),
+        })],
+        Arc::new(SurrealMemory::new(dir.path()).await.unwrap()),
+        "test",
+        "test",
+    );
+    assert_eq!(
+        runner
+            .handle_message(&message("wire", "hello"), &NullChannel::new("test"))
+            .await
+            .unwrap(),
+        "finished"
+    );
+    let requests = requests.lock().unwrap();
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|m| m["role"] == "assistant"
+        && m["tool_calls"][0]["id"] == "call_1"
+        && m["tool_calls"][0]["function"]["name"] == "probe"));
+    assert!(messages
+        .iter()
+        .any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_1" && m["content"] == "hello"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn channel_closure_ends_runtime_with_live_heartbeat() {
+    struct ClosedChannel;
+    #[async_trait]
+    impl apollo::channels::Channel for ClosedChannel {
+        fn name(&self) -> &str {
+            "closed"
+        }
+        async fn start(&mut self) -> anyhow::Result<tokio::sync::mpsc::Receiver<IncomingMessage>> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn send(
+            &self,
+            _: apollo::channels::OutgoingMessage,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        async fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let h = harness().await;
+    let (_heartbeat, rx) = tokio::sync::mpsc::channel(1);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        h.runner.run_with_extra_rx(&mut ClosedChannel, rx),
+    )
+    .await
+    .expect("closed channel must not wait for heartbeat")
+    .unwrap();
+}
+
 /// rx4 must actually cycle a tool, and the final text must come back out
 /// through apollo's `finish_execution`.
 #[tokio::test]
@@ -236,6 +356,15 @@ async fn rx4_engine_runs_a_tool_and_returns_the_reply() {
         tools.iter().all(|t| t.iter().any(|n| n == "probe")),
         "tool specs lost crossing the bridge: {tools:?}"
     );
+    let transcript = h.provider.seen_transcript.lock().unwrap();
+    let followup = transcript.last().unwrap();
+    assert!(followup.iter().any(|m| m
+        .tool_calls
+        .iter()
+        .any(|c| c.id == "call_1" && c.name == "probe")));
+    assert!(followup
+        .iter()
+        .any(|m| m.role == "tool_result" && m.tool_use_id.as_deref() == Some("call_1")));
 }
 
 /// A denied tool must not execute under rx4. This is the assertion that was

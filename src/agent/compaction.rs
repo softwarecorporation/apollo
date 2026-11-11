@@ -118,11 +118,13 @@ impl Compactor for DefaultCompactor {
                 summary
             ),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         });
         compacted.push(ChatMessage {
             role: "assistant".into(),
             content: "Understood, continuing from summary.".into(),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         });
         compacted.extend(recent_msgs.iter().map(|m| (*m).clone()));
 

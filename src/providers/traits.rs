@@ -16,6 +16,8 @@ pub struct ChatMessage {
     /// For tool_result messages: the tool_use_id this is responding to
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatMessage {
@@ -24,6 +26,7 @@ impl ChatMessage {
             role: "system".into(),
             content: content.into(),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
@@ -31,6 +34,7 @@ impl ChatMessage {
             role: "user".into(),
             content: content.into(),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -38,6 +42,7 @@ impl ChatMessage {
             role: "assistant".into(),
             content: content.into(),
             tool_use_id: None,
+            tool_calls: Vec::new(),
         }
     }
     pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -45,6 +50,7 @@ impl ChatMessage {
             role: "tool_result".into(),
             content: content.into(),
             tool_use_id: Some(id.into()),
+            tool_calls: Vec::new(),
         }
     }
     pub fn is_tool_result(&self) -> bool {

@@ -50,7 +50,7 @@ impl Tool for ZkrTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["remember", "search", "get", "correct", "delete", "profiles", "profile_pager"] },
+                    "action": { "type": "string", "enum": ["remember", "search", "get", "correct", "delete", "profile", "profiles", "profile_pager"] },
                     "text": { "type": "string" },
                     "source_kind": { "type": "string", "enum": ["conversation", "screen", "audio", "document", "integration", "user_correction"] },
                     "ingestion_key": { "type": "string" },
@@ -140,7 +140,7 @@ impl Tool for ZkrTool {
                         args.value
                             .ok_or_else(|| anyhow::anyhow!("value is required"))?,
                         args.valid_at
-                            .ok_or_else(|| anyhow::anyhow!("valid_at is required"))?,
+                            .unwrap_or_else(|| chrono::Utc::now().timestamp()),
                     )
                     .await?,
             )?,
@@ -150,6 +150,15 @@ impl Tool for ZkrTool {
                     .delete(
                         args.source_id
                             .ok_or_else(|| anyhow::anyhow!("source_id is required"))?,
+                    )
+                    .await?,
+            )?,
+            "profile" => serde_json::to_string_pretty(
+                &self
+                    .store
+                    .profile(
+                        args.claim_id
+                            .ok_or_else(|| anyhow::anyhow!("claim_id is required"))?,
                     )
                     .await?,
             )?,
@@ -185,5 +194,48 @@ mod tests {
             .await
             .unwrap();
         assert!(searched.output.contains("evidence_ids"));
+    }
+
+    #[tokio::test]
+    async fn profile_correction_survives_reopen_with_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        let store = Arc::new(ZkrStore::open(&path, "test", "person").unwrap());
+        let tool = ZkrTool::new(Arc::clone(&store));
+        let remembered = tool.execute(&serde_json::json!({
+            "action": "remember", "text": "My favorite tea is jasmine", "source_kind": "conversation",
+            "subject": "user", "predicate": "favorite tea", "value": "jasmine", "claim_kind": "profile_fact"
+        }).to_string()).await.unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&remembered.output).unwrap();
+        let original = saved["claim_id"].as_str().unwrap();
+        assert!(saved["evidence_id"].is_string());
+        tool.execute(&serde_json::json!({"action":"profile", "claim_id":original}).to_string())
+            .await
+            .unwrap();
+        assert_eq!(store.profiles(10).await.unwrap()[0].value, "jasmine");
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let corrected = tool.execute(&serde_json::json!({
+            "action":"correct", "claim_id":original, "text":"Correction: my favorite tea is oolong",
+            "value":"oolong", "valid_at":chrono::Utc::now().timestamp()
+        }).to_string()).await.unwrap();
+        let corrected: serde_json::Value = serde_json::from_str(&corrected.output).unwrap();
+        assert!(corrected["evidence_id"].is_string());
+        tool.execute(
+            &serde_json::json!({"action":"profile", "claim_id":corrected["claim_id"]}).to_string(),
+        )
+        .await
+        .unwrap();
+        drop(tool);
+        drop(store);
+
+        let reopened = ZkrStore::open(&path, "test", "person").unwrap();
+        let profile = reopened.profiles(10).await.unwrap();
+        assert_eq!(profile.len(), 1);
+        assert_eq!(profile[0].value, "oolong");
+        assert_eq!(
+            profile[0].claim_id.to_string(),
+            corrected["claim_id"].as_str().unwrap()
+        );
     }
 }

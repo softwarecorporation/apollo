@@ -358,7 +358,15 @@ pub fn chat_message_to_rx4(msg: &ChatMessage) -> Message {
         role,
         content: msg.content.clone(),
         tool_call_id: msg.tool_use_id.clone(),
-        tool_calls: Vec::new(),
+        tool_calls: msg
+            .tool_calls
+            .iter()
+            .map(|call| rx4::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -374,6 +382,15 @@ pub fn rx4_message_to_chat(msg: &Message) -> ChatMessage {
         role: role.to_string(),
         content: msg.content.clone(),
         tool_use_id: msg.tool_call_id.clone(),
+        tool_calls: msg
+            .tool_calls
+            .iter()
+            .map(|call| crate::providers::ToolCall {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            })
+            .collect(),
     }
 }
 

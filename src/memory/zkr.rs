@@ -5,8 +5,9 @@ use parking_lot::Mutex;
 use rusqlite::OptionalExtension;
 use zkr::{
     ClaimId, ClaimInput, ClaimKind, CorrectInput, DeleteInput, EmbeddingTarget, EvidenceId,
-    GetInput, MemoryDb, PersonId, ProfilesInput, RememberInput, Remembered, RetrievalItem,
-    RetrievalPack, ReviewInput, SearchInput, SourceId, SourceKind, TenantId,
+    GetInput, MemoryDb, PersonId, ProfileInput, ProfileStability, ProfilesInput, RememberInput,
+    Remembered, RetrievalItem, RetrievalPack, ReviewInput, SearchInput, SourceId, SourceKind,
+    TenantId,
 };
 
 pub struct ZkrStore {
@@ -193,6 +194,23 @@ impl ZkrStore {
                 tenant_id,
                 person_id,
                 limit,
+            })
+        })
+        .await??)
+    }
+
+    pub async fn profile(&self, claim_id: String) -> anyhow::Result<zkr::ProfileEntry> {
+        let claim_id = ClaimId::new(claim_id).map_err(|e| anyhow::anyhow!(e))?;
+        let db = Arc::clone(&self.db);
+        let tenant_id = self.tenant_id.clone();
+        let person_id = self.person_id.clone();
+        Ok(tokio::task::spawn_blocking(move || {
+            db.lock().store_profile(ProfileInput {
+                tenant_id,
+                person_id,
+                claim_id,
+                stability: ProfileStability::Current,
+                recorded_at: chrono::Utc::now().timestamp(),
             })
         })
         .await??)

@@ -55,6 +55,7 @@ pub struct AgentRunner {
     trajectories: Arc<RwLock<HashMap<String, Trajectory>>>,
     /// Whether this runner may read or persist conversational memory.
     memory_enabled: bool,
+    toolsets: crate::config::ToolsetConfig,
     memory_ideas: crate::config::MemoryIdeasConfig,
     group_chat: crate::config::GroupChatConfig,
     #[cfg(feature = "zkr-memory")]
@@ -100,6 +101,7 @@ impl AgentRunner {
             plugin_registry: Arc::new(RwLock::new(PluginRegistry::new())),
             trajectories: Arc::new(RwLock::new(HashMap::new())),
             memory_enabled: true,
+            toolsets: crate::config::ToolsetConfig::default(),
             memory_ideas: crate::config::MemoryIdeasConfig::default(),
             group_chat: crate::config::GroupChatConfig::default(),
             #[cfg(feature = "zkr-memory")]
@@ -137,6 +139,11 @@ impl AgentRunner {
 
     pub fn with_config(mut self, config: crate::config::AgentConfig) -> Self {
         self.agent_config = config;
+        self
+    }
+
+    pub fn with_toolsets(mut self, toolsets: crate::config::ToolsetConfig) -> Self {
+        self.toolsets = toolsets;
         self
     }
 
@@ -189,6 +196,9 @@ impl AgentRunner {
             let mut existing_names: std::collections::HashSet<_> =
                 tools.iter().map(|t| t.name().to_string()).collect();
             for tool in registry.tools() {
+                if !crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets) {
+                    continue;
+                }
                 if existing_names.contains(tool.name()) {
                     tracing::warn!(
                         "plugin tool '{}' shadows a built-in of the same name; keeping the built-in",
@@ -327,7 +337,9 @@ impl AgentRunner {
     }
 
     pub async fn add_tool(&self, tool: Arc<dyn Tool>) {
-        self.tools.write().await.push(tool);
+        if crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets) {
+            self.tools.write().await.push(tool);
+        }
     }
 
     /// Access the hook manager (for plugin tool registration)
@@ -459,7 +471,7 @@ impl AgentRunner {
 
         loop {
             let msg = tokio::select! {
-                Some(msg) = rx.recv() => msg,
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
                 Some(msg) = extra_rx.recv() => msg,
                 else => break,
             };
@@ -516,7 +528,7 @@ impl AgentRunner {
                 Cron(crate::cron_scheduler::DueJob),
             }
             let input = tokio::select! {
-                Some(msg) = rx.recv() => RuntimeInput::Message(msg),
+                msg = rx.recv() => match msg { Some(msg) => RuntimeInput::Message(msg), None => break },
                 Some(msg) = extra_rx.recv() => RuntimeInput::Message(msg),
                 Some(job) = cron_rx.recv() => RuntimeInput::Cron(job),
                 else => break,
@@ -816,7 +828,14 @@ impl AgentRunner {
         }
         messages.push(ChatMessage::user(&user_turn));
 
-        let tools_snapshot: Vec<Arc<dyn Tool>> = self.tools.read().await.iter().cloned().collect();
+        let tools_snapshot: Vec<Arc<dyn Tool>> = self
+            .tools
+            .read()
+            .await
+            .iter()
+            .filter(|tool| crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets))
+            .cloned()
+            .collect();
         let (dial_model, dial_effort) = self.turn_model_and_effort();
         // An explicit per-call model still wins. Otherwise the main dial does.
         let main_model = model.map(str::to_string).unwrap_or(dial_model);

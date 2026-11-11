@@ -205,7 +205,19 @@ impl Provider for OpenAiCompatProvider {
         let messages: Vec<Value> = request
             .messages
             .iter()
-            .map(|m| serde_json::json!({ "role": &m.role, "content": &m.content }))
+            .map(|m| {
+                let role = if m.is_tool_result() { "tool" } else { &m.role };
+                let mut message = serde_json::json!({ "role": role, "content": &m.content });
+                if let Some(id) = &m.tool_use_id {
+                    message["tool_call_id"] = serde_json::json!(id);
+                }
+                if !m.tool_calls.is_empty() {
+                    message["tool_calls"] = serde_json::json!(m.tool_calls.iter().map(|call| {
+                        serde_json::json!({"id":call.id, "type":"function", "function":{"name":call.name,"arguments":call.arguments}})
+                    }).collect::<Vec<_>>());
+                }
+                message
+            })
             .collect();
 
         let mut body = serde_json::json!({
