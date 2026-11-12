@@ -47,8 +47,38 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[cfg(feature = "native-state-fixture")]
+#[derive(Subcommand)]
+enum FixtureOperation {
+    /// Read the latest fixture snapshot
+    Read,
+    /// Write a synthetic value, conditional on the complete prior version
+    Edit {
+        #[arg(long)]
+        slot: usize,
+        #[arg(long, allow_hyphen_values = true)]
+        value: i32,
+        #[arg(long)]
+        source: String,
+        /// JSON version returned by read; omit only when creating a profile
+        #[arg(long)]
+        expected: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Exercise synthetic versioned state publication (not Lyceus learning)
+    #[cfg(feature = "native-state-fixture")]
+    NativeStateFixture {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        profile: String,
+        #[command(subcommand)]
+        operation: FixtureOperation,
+    },
+
     /// Run Lyceus's fixed synthetic inference probe (not chat or learning)
     #[cfg(unix)]
     LyceusSynthetic {
@@ -789,6 +819,38 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match command {
+        #[cfg(feature = "native-state-fixture")]
+        Commands::NativeStateFixture {
+            db,
+            profile,
+            operation,
+        } => {
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                match operation {
+                    FixtureOperation::Read => Ok(serde_json::to_string(
+                        &apollo::native_state::read(&db, &profile)?,
+                    )?),
+                    FixtureOperation::Edit {
+                        slot,
+                        value,
+                        source,
+                        expected,
+                    } => {
+                        let version = expected.as_deref().map(serde_json::from_str).transpose()?;
+                        Ok(serde_json::to_string(&apollo::native_state::edit(
+                            &db,
+                            &profile,
+                            version.as_ref(),
+                            slot,
+                            value,
+                            &source,
+                        )?)?)
+                    }
+                }
+            })
+            .await??;
+            println!("{result}");
+        }
         #[cfg(unix)]
         Commands::LyceusSynthetic { socket } => {
             use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

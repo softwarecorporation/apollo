@@ -35,6 +35,8 @@ pub mod http;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory;
+#[cfg(feature = "native-state-fixture")]
+pub mod native_state;
 pub mod plugin;
 pub mod plugin_exec;
 pub mod plugin_hosts;
