@@ -679,6 +679,43 @@ impl AgentRunner {
         let effective_text = msg.text.clone();
         let mode = self.get_mode();
 
+        #[cfg(feature = "zkr-memory")]
+        if !msg.is_group
+            && channel.name() == "cli"
+            && msg.sender_id == "local"
+            && msg.chat_id == "cli"
+            && self
+                .toolsets
+                .enabled
+                .iter()
+                .any(|name| name == "personal_profile")
+            && crate::tools::toolsets::is_tool_enabled("personal_profile", &self.toolsets)
+        {
+            if !self.memory_enabled {
+                return self
+                    .finish_execution(
+                        msg,
+                        "Profile memory is disabled; no profile change was made.",
+                        &delivery,
+                    )
+                    .await;
+            }
+            let Some(store) = &self.zkr else {
+                return self
+                    .finish_execution(
+                        msg,
+                        "Profile store unavailable; no profile change was made.",
+                        &delivery,
+                    )
+                    .await;
+            };
+            if let Some(response) =
+                crate::tools::zkr::confirmed_profile_command(store, &effective_text).await
+            {
+                return self.finish_execution(msg, &response, &delivery).await;
+            }
+        }
+
         // ── Build messages ──
 
         let base_prompt = self.system_prompt.read().await.clone();
@@ -828,7 +865,8 @@ impl AgentRunner {
         }
         messages.push(ChatMessage::user(&user_turn));
 
-        let tools_snapshot: Vec<Arc<dyn Tool>> = self
+        #[allow(unused_mut)]
+        let mut tools_snapshot: Vec<Arc<dyn Tool>> = self
             .tools
             .read()
             .await
@@ -836,6 +874,30 @@ impl AgentRunner {
             .filter(|tool| crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets))
             .cloned()
             .collect();
+        #[cfg(feature = "zkr-memory")]
+        let personal_profile = if self.memory_enabled
+            && !msg.is_group
+            && channel.name() == "cli"
+            && msg.sender_id == "local"
+            && msg.chat_id == "cli"
+            && self
+                .toolsets
+                .enabled
+                .iter()
+                .any(|name| name == "personal_profile")
+            && crate::tools::toolsets::is_tool_enabled("personal_profile", &self.toolsets)
+        {
+            self.zkr.as_ref().map(|_| {
+                tools_snapshot.clear();
+                let tool = Arc::new(crate::tools::zkr::PersonalProfileTool::new(
+                    effective_text.clone(),
+                ));
+                tools_snapshot.push(tool.clone());
+                tool
+            })
+        } else {
+            None
+        };
         let (dial_model, dial_effort) = self.turn_model_and_effort();
         // An explicit per-call model still wins. Otherwise the main dial does.
         let main_model = model.map(str::to_string).unwrap_or(dial_model);
@@ -851,6 +913,24 @@ impl AgentRunner {
                 &msg.chat_id,
             )
             .await?;
+        #[cfg(feature = "zkr-memory")]
+        let text = if let Some(tool) = personal_profile {
+            if let Some(proposal) = tool.proposal() {
+                proposal
+            } else {
+                let snapshot = match &self.zkr {
+                    Some(store) => {
+                        crate::tools::zkr::confirmed_profile_command(store, "/profile show")
+                            .await
+                            .unwrap_or_default()
+                    }
+                    None => "Profile unavailable.".into(),
+                };
+                format!("No profile change was made in this turn.\n\n{snapshot}")
+            }
+        } else {
+            text
+        };
         self.finish_execution(msg, &text, &delivery).await
     }
 

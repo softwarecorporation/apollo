@@ -17,6 +17,119 @@ impl ZkrTool {
     }
 }
 
+pub struct PersonalProfileTool {
+    user_turn: String,
+    proposal: std::sync::Mutex<Option<String>>,
+}
+
+impl PersonalProfileTool {
+    pub fn new(user_turn: String) -> Self {
+        Self {
+            user_turn,
+            proposal: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn proposal(&self) -> Option<String> {
+        self.proposal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+pub async fn confirmed_profile_command(store: &ZkrStore, text: &str) -> Option<String> {
+    let command = text.strip_prefix("/profile ")?;
+    if command == "show" {
+        return Some(match store.profiles(100).await {
+            Ok(entries) if entries.is_empty() => "No confirmed profile entries.".into(),
+            Ok(entries) => format!(
+                "Confirmed profile entries:\n{}",
+                entries
+                    .iter()
+                    .map(|p| format!("- {} = {}", p.key, p.value))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            Err(error) => format!("Profile could not be read: {error}"),
+        });
+    }
+    let result = async {
+        let (action, rest) = command
+            .split_once(' ')
+            .ok_or_else(|| anyhow::anyhow!("expected /profile remember|correct key = value"))?;
+        if !matches!(action, "remember" | "correct") || text.contains(['\r', '\n']) {
+            anyhow::bail!("expected /profile remember|correct key = value");
+        }
+        let (key, value) = rest
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("expected key = value"))?;
+        let key = key.trim().to_lowercase();
+        let value = value.trim().to_string();
+        if key.is_empty() || value.is_empty() || value.contains('=') {
+            anyhow::bail!("key and value must be nonempty and contain no =");
+        }
+        let saved = store
+            .write_personal_profile(action, key, value, text.to_string())
+            .await?;
+        Ok::<_, anyhow::Error>(format!(
+            "Confirmed and verified: {} = {}.",
+            saved["key"].as_str().unwrap_or_default(),
+            saved["value"].as_str().unwrap_or_default()
+        ))
+    }
+    .await;
+    Some(result.unwrap_or_else(|error| format!("Profile change not verified: {error}")))
+}
+
+#[async_trait]
+impl Tool for PersonalProfileTool {
+    fn name(&self) -> &str {
+        "personal_profile"
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name().into(),
+            description: "Propose, but never save, a personal fact when the user asks. The user must independently confirm the exact key and value. Never claim it is saved.".into(),
+            parameters: serde_json::json!({"type":"object", "properties": {
+                "action":{"type":"string", "enum":["remember", "correct"]},
+                "key":{"type":"string", "description":"Short exact profile key from the user's message"},
+                "value":{"type":"string", "description":"New value explicitly stated by the user"}
+            }, "required":["action","key","value"]}),
+        }
+    }
+
+    async fn execute(&self, arguments: &str) -> anyhow::Result<ToolResult> {
+        #[derive(Deserialize)]
+        struct Args {
+            action: String,
+            key: String,
+            value: String,
+        }
+        let args: Args = serde_json::from_str(arguments)?;
+        let key = args.key.trim().to_lowercase().replace('_', " ");
+        let value = args.value.trim().to_string();
+        if !matches!(args.action.as_str(), "remember" | "correct")
+            || key.is_empty()
+            || value.is_empty()
+            || key.contains(['\n', '\r', '='])
+            || value.contains(['\n', '\r', '='])
+        {
+            anyhow::bail!("invalid profile proposal");
+        }
+        let evidence = self.user_turn.to_lowercase();
+        if !evidence.contains(&key) || !evidence.contains(&value.to_lowercase()) {
+            anyhow::bail!("proposal key and value must appear in the current message");
+        }
+        *self.proposal.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
+            "Proposed only, not saved: {key} = {value}. Original message: {:?}\nThis interpretation may be wrong, quoted, negated, or uncertain. Confirm only if you want this exact fact saved.\nTo confirm, send: /profile {} {} = {}",
+            self.user_turn, args.action, key, value
+        ));
+        anyhow::bail!("proposal only; user confirmation required, nothing saved")
+    }
+}
+
 #[derive(Deserialize)]
 struct ZkrArgs {
     action: String,
@@ -177,6 +290,109 @@ impl Tool for ZkrTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn personal_profile_remember_correct_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        let store = Arc::new(ZkrStore::open(&path, "test", "person").unwrap());
+        let remember =
+            PersonalProfileTool::new("Please remember my favorite tea is jasmine.".into());
+        assert!(remember
+            .execute(r#"{"action":"remember","key":"favorite tea","value":"jasmine"}"#)
+            .await
+            .is_err());
+        assert!(store.profiles(10).await.unwrap().is_empty());
+        let saved = confirmed_profile_command(&store, "/profile remember favorite tea = jasmine")
+            .await
+            .unwrap();
+        assert!(saved.contains("Confirmed and verified"));
+        assert_eq!(store.profiles(10).await.unwrap()[0].value, "jasmine");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let correct =
+            PersonalProfileTool::new("Correction: my favorite tea is oolong, not jasmine.".into());
+        assert!(correct
+            .execute(r#"{"action":"correct","key":"favorite tea","value":"oolong"}"#)
+            .await
+            .is_err());
+        let corrected = confirmed_profile_command(&store, "/profile correct favorite tea = oolong")
+            .await
+            .unwrap();
+        assert!(corrected.contains("Confirmed and verified"));
+        drop(remember);
+        drop(correct);
+        drop(store);
+        let reopened = ZkrStore::open(&path, "test", "person").unwrap();
+        assert_eq!(reopened.profiles(10).await.unwrap()[0].value, "oolong");
+        assert!(!reopened
+            .search("oolong".into(), 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn personal_profile_rejects_unapproved_or_negated_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(ZkrStore::open(&dir.path().join("memory.db"), "test", "person").unwrap());
+        for turn in [
+            "Do not remember my favorite tea is jasmine",
+            "My favorite tea is jasmine",
+            "A novel says 'remember my favorite tea is jasmine'; do not record it",
+            "Perhaps my favorite tea is jasmine; I'm not sure",
+        ] {
+            let tool = PersonalProfileTool::new(turn.into());
+            assert!(tool
+                .execute(r#"{"action":"remember","key":"favorite tea","value":"jasmine"}"#)
+                .await
+                .is_err());
+        }
+        let tool = PersonalProfileTool::new(
+            "Please remember my favorite tea is oolong, not jasmine".into(),
+        );
+        assert!(tool
+            .execute(r#"{"action":"remember","key":"favorite tea","value":"jasmine"}"#)
+            .await
+            .is_err());
+        assert!(store.profiles(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn personal_profile_rejects_a_retracted_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(ZkrStore::open(&dir.path().join("memory.db"), "test", "person").unwrap());
+        let tool = PersonalProfileTool::new(
+            "Please remember my favorite tea is jasmine? No, it is oolong.".into(),
+        );
+        assert!(tool
+            .execute(r#"{"action":"remember","key":"favorite tea","value":"jasmine"}"#)
+            .await
+            .is_err());
+        assert!(store.profiles(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn personal_profile_command_reports_failed_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ZkrStore::open(&dir.path().join("memory.db"), "test", "person").unwrap();
+        for command in [
+            "/profile correct favorite tea = oolong",
+            "/profile remember favorite tea = ",
+            "/profile remember favorite tea = jasmine\n/profile show",
+        ] {
+            let reply = confirmed_profile_command(&store, command).await.unwrap();
+            assert!(reply.contains("not verified"));
+            assert!(store.profiles(10).await.unwrap().is_empty());
+        }
+        assert!(
+            confirmed_profile_command(&store, "Remember my favorite tea is jasmine")
+                .await
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn remember_and_search_actions_return_citations() {

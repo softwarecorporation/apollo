@@ -17,6 +17,7 @@ pub struct ZkrStore {
     lookup: Arc<Mutex<rusqlite::Connection>>,
     tenant_id: TenantId,
     person_id: PersonId,
+    profile_write: tokio::sync::Mutex<()>,
 }
 
 impl ZkrStore {
@@ -38,6 +39,7 @@ impl ZkrStore {
             lookup: Arc::new(Mutex::new(lookup)),
             tenant_id: TenantId::new(tenant_id.into())?,
             person_id: PersonId::new(person_id.into())?,
+            profile_write: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -214,6 +216,99 @@ impl ZkrStore {
             })
         })
         .await??)
+    }
+
+    pub async fn write_personal_profile(
+        &self,
+        action: &str,
+        key: String,
+        value: String,
+        evidence: String,
+    ) -> anyhow::Result<serde_json::Value> {
+        let _guard = self.profile_write.lock().await;
+        let lookup = Arc::clone(&self.lookup);
+        let tenant = self.tenant_id.0.clone();
+        let person = self.person_id.0.clone();
+        let lookup_key = key.clone();
+        let existing: Vec<String> = tokio::task::spawn_blocking(move || {
+            let connection = lookup.lock();
+            let mut statement = connection.prepare(
+                "SELECT id FROM claims WHERE tenant_id = ?1 AND person_id = ?2 AND subject = 'user' AND predicate = ?3 AND kind = 'profile_fact' AND status = 'accepted' AND valid_until IS NULL AND recorded_until IS NULL LIMIT 2",
+            )?;
+            let rows = statement.query_map(rusqlite::params![tenant, person, lookup_key], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        }).await??;
+        if existing.len() > 1 {
+            anyhow::bail!("multiple current claims match this key; no change was made");
+        }
+        let existing = existing.into_iter().next();
+        let now = chrono::Utc::now().timestamp();
+        let (claim_id, evidence_id) = match (action, existing) {
+            ("remember", None) => {
+                let saved = self
+                    .remember(
+                        evidence,
+                        SourceKind::Conversation,
+                        None,
+                        Some(ClaimInput {
+                            subject: "user".into(),
+                            predicate: key.clone(),
+                            value: value.clone(),
+                            kind: ClaimKind::ProfileFact,
+                            valid_from: now,
+                            tier: zkr::MemoryTier::LongTerm,
+                            processing_state: zkr::MemoryProcessingState::Processed,
+                        }),
+                        now,
+                    )
+                    .await?;
+                (
+                    saved
+                        .claim_id
+                        .ok_or_else(|| anyhow::anyhow!("claim was not created"))?
+                        .to_string(),
+                    saved.evidence_id.to_string(),
+                )
+            }
+            ("remember", Some(_)) => {
+                anyhow::bail!("profile key already exists; request a correction instead")
+            }
+            ("correct", Some(id)) => {
+                let saved = self.correct(id, evidence, value.clone(), now).await?;
+                (saved.claim_id.to_string(), saved.evidence_id.to_string())
+            }
+            ("correct", None) => {
+                anyhow::bail!("no current profile entry for this key; no correction was made")
+            }
+            _ => anyhow::bail!("action must be remember or correct"),
+        };
+        let profile = self.profile(claim_id.clone()).await.map_err(|e| anyhow::anyhow!(
+            "claim and evidence were stored, but profile projection failed; update is incomplete: {e}"
+        ))?;
+        if profile.key != key || profile.value != value || profile.claim_id.to_string() != claim_id
+        {
+            anyhow::bail!("profile projection verification failed; update is incomplete");
+        }
+        let lookup = Arc::clone(&self.lookup);
+        let tenant = self.tenant_id.0.clone();
+        let person = self.person_id.0.clone();
+        let verified_key = key.clone();
+        let verified_value = value.clone();
+        let verified_claim = claim_id.clone();
+        let verified_evidence = evidence_id.clone();
+        let persisted: bool = tokio::task::spawn_blocking(move || {
+            lookup.lock().query_row(
+                "SELECT EXISTS(SELECT 1 FROM profile_entries p JOIN claim_evidence ce ON ce.claim_id = p.claim_id AND ce.tenant_id = p.tenant_id AND ce.person_id = p.person_id WHERE p.tenant_id = ?1 AND p.person_id = ?2 AND p.key = ?3 AND p.claim_id = ?4 AND ce.evidence_id = ?5 AND p.value = ?6)",
+                rusqlite::params![tenant, person, verified_key, verified_claim, verified_evidence, verified_value],
+                |row| row.get(0),
+            )
+        }).await??;
+        if !persisted {
+            anyhow::bail!("persisted profile evidence verification failed");
+        }
+        Ok(
+            serde_json::json!({"status":"verified", "key":key, "value":value, "claim_id":claim_id, "evidence_id":evidence_id}),
+        )
     }
 
     pub async fn profile_pager(&self, limit: u32) -> anyhow::Result<Option<String>> {

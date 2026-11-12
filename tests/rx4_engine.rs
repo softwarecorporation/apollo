@@ -204,6 +204,39 @@ fn message(chat_id: &str, text: &str) -> IncomingMessage {
     }
 }
 
+#[cfg(feature = "zkr-memory")]
+#[tokio::test]
+async fn confirmed_profile_commands_preserve_truth_after_restart() {
+    let h = harness().await;
+    let path = h._dir.path().join("personal.db");
+    let store = Arc::new(apollo::memory::zkr::ZkrStore::open(&path, "test", "person").unwrap());
+    let runner = h
+        .runner
+        .with_zkr(Some(Arc::clone(&store)), Default::default())
+        .with_toolsets(apollo::config::ToolsetConfig {
+            enabled: vec!["personal_profile".into()],
+            disabled: vec![],
+        });
+    let channel = NullChannel::new("cli");
+    let mut request = message("cli", "/profile remember favorite tea = jasmine");
+    request.sender_id = "scheduler".into();
+    runner.handle_message(&request, &channel).await.unwrap();
+    assert!(store.profiles(10).await.unwrap().is_empty());
+    request.sender_id = "local".into();
+    let response = runner.handle_message(&request, &channel).await.unwrap();
+    assert!(response.contains("Confirmed and verified"));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    request.text = "/profile correct favorite tea = oolong".into();
+    let response = runner.handle_message(&request, &channel).await.unwrap();
+    assert!(response.contains("Confirmed and verified"));
+    drop(runner);
+    drop(store);
+    let reopened = apollo::memory::zkr::ZkrStore::open(&path, "test", "person").unwrap();
+    let profile = reopened.profiles(10).await.unwrap();
+    assert_eq!(profile.len(), 1);
+    assert_eq!(profile[0].value, "oolong");
+}
+
 #[tokio::test]
 async fn tool_allowlist_applies_to_initial_and_late_tools() {
     let h = harness().await;
