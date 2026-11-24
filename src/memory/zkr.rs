@@ -100,7 +100,6 @@ impl ZkrStore {
                 recorded_at,
                 claim,
                 feature_flag: None,
-                aliases: Vec::new(),
             })?)
         })
         .await?
