@@ -47,8 +47,46 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[cfg(feature = "native-state-fixture")]
+#[derive(Subcommand)]
+enum FixtureOperation {
+    /// Read the latest fixture snapshot
+    Read,
+    /// Write a synthetic value, conditional on the complete prior version
+    Edit {
+        #[arg(long)]
+        slot: usize,
+        #[arg(long, allow_hyphen_values = true)]
+        value: i32,
+        #[arg(long)]
+        source: String,
+        /// JSON version returned by read; omit only when creating a profile
+        #[arg(long)]
+        expected: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Exercise synthetic versioned state publication (not Lyceus learning)
+    #[cfg(feature = "native-state-fixture")]
+    NativeStateFixture {
+        #[arg(long)]
+        db: PathBuf,
+        #[arg(long)]
+        profile: String,
+        #[command(subcommand)]
+        operation: FixtureOperation,
+    },
+
+    /// Run Lyceus's fixed synthetic inference probe (not chat or learning)
+    #[cfg(unix)]
+    LyceusSynthetic {
+        /// Path to the private synthetic demo socket
+        #[arg(long)]
+        socket: PathBuf,
+    },
+
     /// Start interactive agent chat
     Chat {
         /// Configuration file path
@@ -659,9 +697,11 @@ async fn build_automation_agent(
             tools.push(Arc::new(tool));
         }
     }
+    tools.retain(|tool| apollo::tools::toolsets::is_tool_enabled(tool.name(), &cfg.toolsets));
 
     let mut runner = AgentRunner::new(provider, tools, memory, &system_prompt, cfg.model.clone())
         .with_config(cfg.agent.clone())
+        .with_toolsets(cfg.toolsets.clone())
         .with_mode(agent_mode_from_permission_profile(
             &cfg.agent.permission_profile,
         ))
@@ -779,6 +819,68 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match command {
+        #[cfg(feature = "native-state-fixture")]
+        Commands::NativeStateFixture {
+            db,
+            profile,
+            operation,
+        } => {
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                match operation {
+                    FixtureOperation::Read => Ok(serde_json::to_string(
+                        &apollo::native_state::read(&db, &profile)?,
+                    )?),
+                    FixtureOperation::Edit {
+                        slot,
+                        value,
+                        source,
+                        expected,
+                    } => {
+                        let version = expected.as_deref().map(serde_json::from_str).transpose()?;
+                        Ok(serde_json::to_string(&apollo::native_state::edit(
+                            &db,
+                            &profile,
+                            version.as_ref(),
+                            slot,
+                            value,
+                            &source,
+                        )?)?)
+                    }
+                }
+            })
+            .await??;
+            println!("{result}");
+        }
+        #[cfg(unix)]
+        Commands::LyceusSynthetic { socket } => {
+            use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+            #[derive(serde::Deserialize, serde::Serialize)]
+            struct SyntheticResult {
+                version: String,
+                request_id: String,
+                answer_byte: u8,
+                target_log_score: f64,
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(130), async {
+                let mut stream = tokio::net::UnixStream::connect(socket).await?;
+                stream
+                    .write_all(b"{\"op\":\"infer\",\"task\":\"synthetic-v1\"}\n")
+                    .await?;
+                let mut response = String::new();
+                let mut reader = BufReader::new(stream.take(8192));
+                reader.read_line(&mut response).await?;
+                if !response.ends_with('\n') {
+                    anyhow::bail!("invalid synthetic inference response frame");
+                }
+                let value: SyntheticResult = serde_json::from_str(&response)?;
+                Ok::<_, anyhow::Error>(value)
+            })
+            .await??;
+            println!(
+                "Lyceus synthetic inference only (not chat or personal memory): {}",
+                serde_json::to_string(&result)?
+            );
+        }
         Commands::Chat {
             config,
             model,
@@ -848,6 +950,9 @@ async fn main() -> anyhow::Result<()> {
             if dynamic_count > 0 {
                 println!("   Loaded {} custom tool(s)", dynamic_count);
             }
+            tools.retain(|tool| {
+                apollo::tools::toolsets::is_tool_enabled(tool.name(), &cfg.toolsets)
+            });
 
             // Start swarm coordinator if requested
             #[cfg(feature = "swarm")]
@@ -865,6 +970,7 @@ async fn main() -> anyhow::Result<()> {
             let mut runner =
                 AgentRunner::new(provider, tools, memory.clone(), &system_prompt, model)
                     .with_config(cfg.agent.clone())
+                    .with_toolsets(cfg.toolsets.clone())
                     .with_config_path(config.as_str())
                     .with_mode(agent_mode_from_permission_profile(
                         &cfg.agent.permission_profile,
@@ -1005,10 +1111,12 @@ async fn main() -> anyhow::Result<()> {
                         println!("   Workspace: {}", workspace.display());
                         println!("   Channel: CLI");
                         println!("   Type /quit to exit");
-                        println!(
-                            "   Agent HTTP: http://{}/v1/chat (APOLLO_HTTP_PORT)",
-                            apollo::agent_http::http_listen_addr()
-                        );
+                        if http_server.is_some() {
+                            println!(
+                                "   Agent HTTP: http://{}/v1/chat (APOLLO_HTTP_PORT)",
+                                apollo::agent_http::http_listen_addr()
+                            );
+                        }
                         println!();
 
                         // Start heartbeat background task

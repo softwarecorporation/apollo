@@ -55,6 +55,7 @@ pub struct AgentRunner {
     trajectories: Arc<RwLock<HashMap<String, Trajectory>>>,
     /// Whether this runner may read or persist conversational memory.
     memory_enabled: bool,
+    toolsets: crate::config::ToolsetConfig,
     memory_ideas: crate::config::MemoryIdeasConfig,
     group_chat: crate::config::GroupChatConfig,
     #[cfg(feature = "zkr-memory")]
@@ -100,6 +101,7 @@ impl AgentRunner {
             plugin_registry: Arc::new(RwLock::new(PluginRegistry::new())),
             trajectories: Arc::new(RwLock::new(HashMap::new())),
             memory_enabled: true,
+            toolsets: crate::config::ToolsetConfig::default(),
             memory_ideas: crate::config::MemoryIdeasConfig::default(),
             group_chat: crate::config::GroupChatConfig::default(),
             #[cfg(feature = "zkr-memory")]
@@ -137,6 +139,11 @@ impl AgentRunner {
 
     pub fn with_config(mut self, config: crate::config::AgentConfig) -> Self {
         self.agent_config = config;
+        self
+    }
+
+    pub fn with_toolsets(mut self, toolsets: crate::config::ToolsetConfig) -> Self {
+        self.toolsets = toolsets;
         self
     }
 
@@ -189,6 +196,9 @@ impl AgentRunner {
             let mut existing_names: std::collections::HashSet<_> =
                 tools.iter().map(|t| t.name().to_string()).collect();
             for tool in registry.tools() {
+                if !crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets) {
+                    continue;
+                }
                 if existing_names.contains(tool.name()) {
                     tracing::warn!(
                         "plugin tool '{}' shadows a built-in of the same name; keeping the built-in",
@@ -327,7 +337,9 @@ impl AgentRunner {
     }
 
     pub async fn add_tool(&self, tool: Arc<dyn Tool>) {
-        self.tools.write().await.push(tool);
+        if crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets) {
+            self.tools.write().await.push(tool);
+        }
     }
 
     /// Access the hook manager (for plugin tool registration)
@@ -459,7 +471,7 @@ impl AgentRunner {
 
         loop {
             let msg = tokio::select! {
-                Some(msg) = rx.recv() => msg,
+                msg = rx.recv() => match msg { Some(msg) => msg, None => break },
                 Some(msg) = extra_rx.recv() => msg,
                 else => break,
             };
@@ -516,7 +528,7 @@ impl AgentRunner {
                 Cron(crate::cron_scheduler::DueJob),
             }
             let input = tokio::select! {
-                Some(msg) = rx.recv() => RuntimeInput::Message(msg),
+                msg = rx.recv() => match msg { Some(msg) => RuntimeInput::Message(msg), None => break },
                 Some(msg) = extra_rx.recv() => RuntimeInput::Message(msg),
                 Some(job) = cron_rx.recv() => RuntimeInput::Cron(job),
                 else => break,
@@ -667,6 +679,43 @@ impl AgentRunner {
         let effective_text = msg.text.clone();
         let mode = self.get_mode();
 
+        #[cfg(feature = "zkr-memory")]
+        if !msg.is_group
+            && channel.name() == "cli"
+            && msg.sender_id == "local"
+            && msg.chat_id == "cli"
+            && self
+                .toolsets
+                .enabled
+                .iter()
+                .any(|name| name == "personal_profile")
+            && crate::tools::toolsets::is_tool_enabled("personal_profile", &self.toolsets)
+        {
+            if !self.memory_enabled {
+                return self
+                    .finish_execution(
+                        msg,
+                        "Profile memory is disabled; no profile change was made.",
+                        &delivery,
+                    )
+                    .await;
+            }
+            let Some(store) = &self.zkr else {
+                return self
+                    .finish_execution(
+                        msg,
+                        "Profile store unavailable; no profile change was made.",
+                        &delivery,
+                    )
+                    .await;
+            };
+            if let Some(response) =
+                crate::tools::zkr::confirmed_profile_command(store, &effective_text).await
+            {
+                return self.finish_execution(msg, &response, &delivery).await;
+            }
+        }
+
         // ── Build messages ──
 
         let base_prompt = self.system_prompt.read().await.clone();
@@ -816,7 +865,39 @@ impl AgentRunner {
         }
         messages.push(ChatMessage::user(&user_turn));
 
-        let tools_snapshot: Vec<Arc<dyn Tool>> = self.tools.read().await.iter().cloned().collect();
+        #[allow(unused_mut)]
+        let mut tools_snapshot: Vec<Arc<dyn Tool>> = self
+            .tools
+            .read()
+            .await
+            .iter()
+            .filter(|tool| crate::tools::toolsets::is_tool_enabled(tool.name(), &self.toolsets))
+            .cloned()
+            .collect();
+        #[cfg(feature = "zkr-memory")]
+        let personal_profile = if self.memory_enabled
+            && !msg.is_group
+            && channel.name() == "cli"
+            && msg.sender_id == "local"
+            && msg.chat_id == "cli"
+            && self
+                .toolsets
+                .enabled
+                .iter()
+                .any(|name| name == "personal_profile")
+            && crate::tools::toolsets::is_tool_enabled("personal_profile", &self.toolsets)
+        {
+            self.zkr.as_ref().map(|_| {
+                tools_snapshot.clear();
+                let tool = Arc::new(crate::tools::zkr::PersonalProfileTool::new(
+                    effective_text.clone(),
+                ));
+                tools_snapshot.push(tool.clone());
+                tool
+            })
+        } else {
+            None
+        };
         let (dial_model, dial_effort) = self.turn_model_and_effort();
         // An explicit per-call model still wins. Otherwise the main dial does.
         let main_model = model.map(str::to_string).unwrap_or(dial_model);
@@ -832,6 +913,24 @@ impl AgentRunner {
                 &msg.chat_id,
             )
             .await?;
+        #[cfg(feature = "zkr-memory")]
+        let text = if let Some(tool) = personal_profile {
+            if let Some(proposal) = tool.proposal() {
+                proposal
+            } else {
+                let snapshot = match &self.zkr {
+                    Some(store) => {
+                        crate::tools::zkr::confirmed_profile_command(store, "/profile show")
+                            .await
+                            .unwrap_or_default()
+                    }
+                    None => "Profile unavailable.".into(),
+                };
+                format!("No profile change was made in this turn.\n\n{snapshot}")
+            }
+        } else {
+            text
+        };
         self.finish_execution(msg, &text, &delivery).await
     }
 

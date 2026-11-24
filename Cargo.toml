@@ -74,6 +74,7 @@ swarm = []
 
 # Evidence-backed temporal memory (zkr on crates.io)
 zkr-memory = ["dep:zkr", "dep:rusqlite"]
+native-state-fixture = ["dep:rusqlite"]
 
 # Bundles
 all-channels = ["channel-cli", "channel-telegram", "channel-discord", "channel-slack", "channel-whatsapp", "channel-signal", "channel-matrix", "channel-irc", "channel-googlechat", "channel-msteams"]
